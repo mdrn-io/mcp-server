@@ -1,0 +1,18 @@
+import {existsSync,readFileSync,writeFileSync,mkdirSync} from 'node:fs';
+import {resolve} from 'node:path';
+const check=process.argv.includes('--check');const source=process.argv.slice(2).find(a=>a!=='--check');if(!source)throw Error('Usage: node scripts/sync-contract.mjs [--check] ../docs/site/mdrn-mvp.openapi.json');
+const spec=JSON.parse(readFileSync(source,'utf8'));
+const root=resolve(new URL('..',import.meta.url).pathname.replace(/^\/([A-Za-z]:)/,'$1'));
+const category=root.split(/[\\/]/).at(-1);
+// The operations the MCP tools call (src/server.js), each with the methods it uses.
+const used={'/v1/platform/workspaces':['get'],'/v1/platform/projects':['get'],'/v1/platform/usage':['get'],'/v1/platform/workspaces/{workspaceId}/billing':['get'],'/v1/platform/projects/{projectId}/environments/{environmentId}/products':['get'],'/v1/platform/operations/{operationId}':['get'],'/v1/deploy/services':['get','post'],'/v1/deploy/deployments':['get','post'],'/v1/deploy/deployments/{deploymentId}':['get'],'/v1/deploy/domains':['get'],'/v1/deploy/domains/{domainId}':['get'],'/v1/platform/projects/{projectId}/environments/{environmentId}/identity/origins':['get'],'/v1/deploy/builds':['get'],'/v1/deploy/builds/{buildId}':['get'],'/v1/deploy/builds/{buildId}/logs':['get'],'/v1/deploy/releases':['get'],'/v1/deploy/logs':['get'],'/v1/deploy/logs/trace/{traceId}':['get'],'/v1/deploy/services/{serviceId}/github':['get','put'],'/v1/deploy/services/{serviceId}/variables/{name}':['put','delete'],'/v1/platform/projects/{projectId}/environments/{environmentId}/products/{product}/enable':['post'],'/v1/platform/projects/{projectId}/environments/{environmentId}/products/{product}/disable':['post']};
+const paths={};for(const [path,item] of Object.entries(spec.paths)){
+ const allowed=category==='sdk'?(path.startsWith('/_mdrn/v1/database/collections/')||(path.startsWith('/v1/storage/')&&!path.endsWith('/restore')&&path!=='/v1/storage/data')):category==='mcp'?path in used:(path.startsWith('/v1/platform/')||path.startsWith('/v1/deploy/'));
+ if(allowed)paths[path]=category==='mcp'?Object.fromEntries(Object.entries(item).filter(([k])=>[...used[path],'parameters','summary','description'].includes(k))):item;
+}
+const out={openapi:spec.openapi,info:{title:`MDRN ${category} contract snapshot`,version:spec.info.version,description:'Selected operations from the canonical shared contract. This snapshot is not a claim that all raw CLI operations have named helpers.'},servers:spec.servers,paths,components:{securitySchemes:spec.components.securitySchemes,schemas:{}}};
+const pending=[];const scan=x=>{if(!x||typeof x!=='object')return;for(const [k,v]of Object.entries(x)){if(k==='$ref'&&typeof v==='string'&&v.startsWith('#/components/schemas/'))pending.push(v.split('/').at(-1));else scan(v)}};scan(paths);
+while(pending.length){const name=pending.pop();if(out.components.schemas[name])continue;const schema=spec.components.schemas[name];if(!schema)throw Error(`Missing schema ${name}`);out.components.schemas[name]=schema;scan(schema)}
+const target=resolve(root,'contracts/client.openapi.json');const text=JSON.stringify(out,null,2)+'\n';
+if(check){const current=existsSync(target)?readFileSync(target,'utf8').replace(/\r\n/g,'\n'):'';if(current!==text){console.error(`${category}: contracts/client.openapi.json is stale; rerun this command without --check`);process.exit(1)}console.log(`${category}: contract snapshot is current`);process.exit(0)}
+mkdirSync(resolve(root,'contracts'),{recursive:true});writeFileSync(target,text);console.log(`${category}: ${Object.keys(paths).length} route families synchronized`);

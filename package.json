@@ -1,0 +1,15 @@
+{
+  "name": "@mdrnio/mcp-server",
+  "version": "0.2.1",
+  "license": "MIT",
+  "homepage": "https://mdrn.io/docs/mcp/",
+  "repository": { "type": "git", "url": "git+https://github.com/mdrn-io/mcp-server.git" },
+  "bugs": "https://github.com/mdrn-io/mcp-server/issues",
+  "type": "module",
+  "files": ["src/server.js", "src/stdio.js", "README.md"],
+  "bin": { "mdrn-mcp": "./src/stdio.js" },
+  "scripts": { "test": "node scripts/sync-contract.mjs --check ../docs/site/mdrn-mvp.openapi.json && node --test" },
+  "dependencies": { "@mdrnio/cli": "^0.2.1" },
+  "engines": { "node": ">=20" },
+  "publishConfig": { "access": "public" }
+}

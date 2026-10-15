@@ -1,0 +1,27 @@
+// The hosted MCP server for the development stage at https://development.mcp.mdrn.io/mcp (worker "mcp" in
+// infra/cloudflare/development/manifest.json), released by Deploy like every other Worker. Wrangler
+// bundles src/worker.js itself: it imports nothing outside mcp/src but package.json (its version), so there is no build step.
+// The route keeps the hostname from production Proxy's */* (routes run before custom domains),
+// and the custom domain gives it its DNS record. It holds no secret: each request's bearer is
+// checked with Platform at API_ORIGIN and forwarded there (src/worker.js).
+// Observability keeps failures only, never a request record.
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "mdrn-mcp-development",
+  "main": "src/worker.js",
+  "account_id": "a7e532b233018ae8525bb587f920bd18",
+  "compatibility_date": "2026-09-17",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    { "pattern": "development.mcp.mdrn.io/*", "zone_name": "mdrn.io" },
+    { "pattern": "development.mcp.mdrn.io", "custom_domain": true }
+  ],
+  "vars": {
+    "STAGE": "development",
+    // The resource every token must be issued for (or none), and Platform, its authorization server.
+    "MCP_RESOURCE": "https://development.mcp.mdrn.io/mcp",
+    "API_ORIGIN": "https://development.api.mdrn.io"
+  },
+  "observability": { "enabled": true, "logs": { "invocation_logs": true, "head_sampling_rate": 1 } }
+}
