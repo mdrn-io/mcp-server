@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { canonicalResource, handle, TOKEN_INFO } from "../src/worker.js";
+import { ALERT_PATH, resetAlertState, sign, THRESHOLD, tokenCheckAnswered, tokenCheckFailed } from "../src/alert.js";
 
 const env = { STAGE: "development", MCP_RESOURCE: "https://development.mcp.mdrn.io/mcp", API_ORIGIN: "https://development.api.mdrn.io" };
 const MCP = "https://development.mcp.mdrn.io/mcp";
@@ -14,6 +15,8 @@ function platform({ tokens = {}, routes = {} } = {}) {
   const fetcher = async (url, init) => {
     const { origin, pathname } = new URL(url);
     assert.equal(origin, env.API_ORIGIN, "only ever the stage's own API");
+    // The Workers runtime throws on redirect "error" before sending anything (every check failed so).
+    assert.notEqual(init.redirect, "error");
     const token = /^Bearer (.+)$/.exec(new Headers(init.headers).get("authorization"))?.[1];
     calls.push({ method: init.method, path: pathname, token });
     if (pathname === TOKEN_INFO) {
@@ -63,11 +66,22 @@ test("an unknown, expired or revoked token gets 401 invalid_token and no tool ru
   assert.deepEqual(api.calls.map((c) => c.path), [TOKEN_INFO]);
 });
 
-test("a token issued for another resource is refused; one for this server or none is accepted", async () => {
-  const api = platform({ tokens: { other: { resource: "https://evil.test/mcp", scopes: ["project:read"] }, mine: { resource: "HTTPS://Development.MCP.mdrn.io/mcp/", scopes: [] }, plain: { resource: null, scopes: [] } } });
-  const refused = await handle(post({ jsonrpc: "2.0", id: 1, method: "tools/list" }, { token: "other" }), env, api.fetcher);
-  assert.equal(refused.status, 401);
-  assert.match(refused.headers.get("www-authenticate"), /not issued for this server/);
+test("an OAuth token is accepted only for this server; a console management token (no grant, no resource) too", async () => {
+  const api = platform({
+    tokens: {
+      other: { resource: "https://evil.test/mcp", scopes: ["project:read"], grantId: "oag_1" },
+      mine: { resource: "HTTPS://Development.MCP.mdrn.io/mcp/", scopes: [], grantId: "oag_2" },
+      plain: { resource: null, scopes: [], grantId: null },
+      // The CLI from 0.4 names MDRN's API; a CLI before it, or another client, named nothing.
+      cli: { resource: "https://development.api.mdrn.io", scopes: ["project:read"], grantId: "oag_3" },
+      unnamed: { resource: null, scopes: ["project:read"], grantId: "oag_4" },
+    },
+  });
+  for (const token of ["other", "cli", "unnamed"]) {
+    const refused = await handle(post({ jsonrpc: "2.0", id: 1, method: "tools/list" }, { token }), env, api.fetcher);
+    assert.equal(refused.status, 401, token);
+    assert.match(refused.headers.get("www-authenticate"), /not issued for this server/);
+  }
   for (const token of ["mine", "plain"]) assert.equal((await handle(post({ jsonrpc: "2.0", id: 1, method: "tools/list" }, { token }), env, api.fetcher)).status, 200, token);
 });
 
@@ -81,7 +95,7 @@ test("initialize, tools/list and a tool call answer JSON, forwarding the caller'
   // The hosted server reports the package's version, bundled from package.json.
   assert.equal(initialized.result.serverInfo.version, JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version);
   const list = await (await handle(post({ jsonrpc: "2.0", id: 2, method: "tools/list" }), env, api.fetcher)).json();
-  assert.ok(list.result.tools.some((tool) => tool.name === "mdrn_deploy_connected_repo"));
+  assert.ok(list.result.tools.some((tool) => tool.name === "mdrn_deploy_from_github"));
   const called = await (await handle(post({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "mdrn_list_projects", arguments: { workspaceId: "w" } } }), env, api.fetcher)).json();
   assert.equal(called.id, 3);
   assert.equal(called.result.isError, false);
@@ -93,7 +107,7 @@ test("initialize, tools/list and a tool call answer JSON, forwarding the caller'
 
 test("a write outside the token's scopes is a tool error and reaches nothing", async () => {
   const api = platform({ tokens: { good } });
-  const response = await handle(post({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "mdrn_create_service", arguments: { projectId: "p", environmentId: "sandbox", name: "shop" } } }), env, api.fetcher);
+  const response = await handle(post({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "mdrn_create_deployment", arguments: { projectId: "p", environmentId: "sandbox", name: "shop" } } }), env, api.fetcher);
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.equal(body.result.isError, true);
@@ -103,7 +117,7 @@ test("a write outside the token's scopes is a tool error and reaches nothing", a
 
 test("a token revoked between the check and the call answers the 401 challenge, not a tool result", async () => {
   const api = platform({ tokens: { good }, routes: { "GET /v1/deploy/builds": [401, { error: { code: "UNAUTHENTICATED", message: "Token revoked" } }] } });
-  const response = await handle(post({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "mdrn_list_builds", arguments: { projectId: "p", environmentId: "sandbox", serviceId: "s" } } }), env, api.fetcher);
+  const response = await handle(post({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "mdrn_list_builds", arguments: { projectId: "p", environmentId: "sandbox", deploymentId: "s" } } }), env, api.fetcher);
   assert.equal(response.status, 401);
   assert.match(response.headers.get("www-authenticate"), /error="invalid_token"/);
 });
@@ -133,9 +147,141 @@ test("the transport refuses what streamable HTTP and this stateless server do no
   assert.equal(await status(post({ jsonrpc: "2.0", id: 1, method: "ping" })), 200);
 });
 
+test("each client address has a budget, spent before Platform is asked; a limiter that fails lets the request on", async () => {
+  const api = platform({ tokens: { good } });
+  const keys = [];
+  let left = 1;
+  const MCP_LIMITER = { limit: async ({ key }) => { keys.push(key); return { success: left-- > 0 }; } };
+  const send = (limited) => handle(post({ jsonrpc: "2.0", id: 1, method: "ping" }, { token: "made-up", headers: { "CF-Connecting-IP": "203.0.113.9" } }), { ...env, MCP_LIMITER: limited }, api.fetcher);
+  assert.equal((await send(MCP_LIMITER)).status, 401, "within the budget the token is checked");
+  const over = await send(MCP_LIMITER);
+  assert.equal(over.status, 429);
+  assert.equal(over.headers.get("retry-after"), "60");
+  assert.deepEqual(keys, ["203.0.113.9", "203.0.113.9"]);
+  assert.equal(api.calls.filter((c) => c.path === TOKEN_INFO).length, 1, "over the budget Platform is not asked");
+  assert.equal((await send({ limit: async () => { throw new Error("down"); } })).status, 401);
+});
+
+test("a body with no length is read only until it passes 1 MiB", async () => {
+  const api = platform({ tokens: { good } });
+  let pulled = 0;
+  const chunk = new TextEncoder().encode("x".repeat(64 * 1024));
+  const body = new ReadableStream({ pull(controller) { pulled += 1; if (pulled > 1000) controller.close(); else controller.enqueue(chunk); } });
+  const request = new Request(MCP, { method: "POST", body, duplex: "half", headers: { "Content-Type": "application/json", Authorization: "Bearer good" } });
+  assert.equal((await handle(request, env, api.fetcher)).status, 413);
+  assert.ok(pulled <= 18, `stopped after ${pulled} chunks`);
+  assert.equal(api.calls.length, 0, "Platform was never asked");
+});
+
 test("Platform unable to check the token is a 503, never a pass", async () => {
+  resetAlertState();
   const response = await handle(post({ jsonrpc: "2.0", id: 1, method: "tools/list" }, { token: "down" }), env, platform({ tokens: { down: "down" } }).fetcher);
   assert.equal(response.status, 503);
+});
+
+test("503 means only a real 5xx, timeout or network fault; any other failed check is our fault (500), and neither is a pass", async () => {
+  resetAlertState();
+  const answer = (respond) => handle(post({ jsonrpc: "2.0", id: 1, method: "tools/list" }), env, async () => respond());
+  assert.equal((await answer(() => { throw new TypeError("fetch failed"); })).status, 503, "network");
+  assert.equal((await answer(() => new Response("bad gateway", { status: 502 }))).status, 503, "5xx");
+  // Cloudflare refusing a fetch to our own zone (error 1042) is no 401/403 and no 5xx.
+  assert.equal((await answer(() => new Response("error code: 1042", { status: 404 }))).status, 500, "1042");
+  assert.equal((await answer(() => new Response("<html>", { status: 200 }))).status, 500, "unreadable body");
+  assert.equal((await answer(() => Response.json({ scopes: "all" }))).status, 500, "unsound body");
+  assert.equal((await answer(() => Response.json({ error: "x" }, { status: 401 }))).status, 401, "a refused token stays a 401");
+});
+
+test("with the PLATFORM binding the token is checked over it, never through the public API; an unknown token is the 401 challenge", async () => {
+  resetAlertState();
+  const checks = [];
+  const PLATFORM = {
+    fetch: async (url, init) => {
+      assert.notEqual(init.redirect, "error");
+      const token = /^Bearer (.+)$/.exec(new Headers(init.headers).get("authorization"))?.[1];
+      checks.push({ url, token });
+      return token === "good" ? Response.json(good) : Response.json({ error: { code: "UNAUTHENTICATED", message: "x" } }, { status: 401 });
+    },
+  };
+  const api = platform({ routes: { "GET /v1/platform/projects": [200, { items: [] }] } });
+  const bound = { ...env, PLATFORM };
+  const bogus = await handle(post({ jsonrpc: "2.0", id: 1, method: "tools/list" }, { token: "bogus" }), bound, api.fetcher);
+  assert.equal(bogus.status, 401);
+  assert.match(bogus.headers.get("www-authenticate"), /^Bearer resource_metadata="[^"]+", error="invalid_token"/);
+  const ok = await handle(post({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "mdrn_list_projects", arguments: { workspaceId: "w" } } }), bound, api.fetcher);
+  assert.equal(ok.status, 200);
+  assert.deepEqual(checks.map((c) => [new URL(c.url).pathname, c.token]), [[TOKEN_INFO, "bogus"], [TOKEN_INFO, "good"]]);
+  assert.ok(checks.every((c) => new URL(c.url).origin !== env.API_ORIGIN));
+  // The tools still call the public API with the caller's bearer; the check never does.
+  assert.ok(api.calls.length > 0 && api.calls.every((c) => c.path !== TOKEN_INFO && c.token === "good"));
+});
+
+test("a fetch that throws is logged by its error's name, never its text", async () => {
+  resetAlertState();
+  const lines = [];
+  const original = console.error;
+  console.error = (line) => lines.push(JSON.parse(line));
+  try {
+    const thrown = await handle(post({ jsonrpc: "2.0", id: 1, method: "tools/list" }), env, async () => { throw new TypeError("Invalid redirect value <runtime text>"); });
+    assert.equal(thrown.status, 503);
+  } finally {
+    console.error = original;
+  }
+  assert.equal(lines[0].cause, "network_TypeError");
+  assert.doesNotMatch(JSON.stringify(lines), /runtime text/);
+});
+
+test("each failed check is logged with our own cause; failures that keep coming raise one signed Alert over PLATFORM", async () => {
+  resetAlertState();
+  const sent = [];
+  const key = "a".repeat(43);
+  // The token check and the Alert share the binding: the check is refused, the Alert is taken.
+  const PLATFORM = {
+    fetch: async (url, init) => {
+      if (new URL(url).pathname === TOKEN_INFO) return new Response("error code: 1042 <secret provider text>", { status: 404 });
+      sent.push({ url, init });
+      return new Response(null, { status: 204 });
+    },
+  };
+  const alerting = { ...env, MCP_ALERT_KEY: key, PLATFORM };
+  const lines = [];
+  const original = console.error;
+  console.error = (line) => lines.push(JSON.parse(line));
+  try {
+    const refused = async () => assert.fail("the check goes over the binding, never the public API");
+    for (let i = 0; i < THRESHOLD - 1; i += 1) await handle(post({ jsonrpc: "2.0", id: i, method: "tools/list" }), alerting, refused);
+    assert.equal(sent.length, 0, "not on a single failure");
+    await handle(post({ jsonrpc: "2.0", id: 9, method: "tools/list" }), alerting, refused);
+    assert.equal(sent.length, 1);
+    await handle(post({ jsonrpc: "2.0", id: 10, method: "tools/list" }), alerting, refused);
+    assert.equal(sent.length, 1, "once, then quiet");
+  } finally {
+    console.error = original;
+  }
+  assert.ok(lines.filter((line) => line.event === "mcp_token_check_failed").every((line) => line.cause === "status_404"));
+  assert.doesNotMatch(JSON.stringify(lines), /secret provider text/);
+  const [{ url, init }] = sent;
+  assert.equal(new URL(url).pathname, ALERT_PATH);
+  const alert = JSON.parse(init.body);
+  assert.equal(alert.component, "mcp");
+  assert.equal(alert.kind, "token_check_failing");
+  assert.equal(alert.key, "development");
+  assert.equal(init.headers["X-MDRN-Operator-Alert"], await sign(key, init.body));
+  assert.doesNotMatch(init.body, /secret provider text/);
+});
+
+test("a check that passes ends the run of failures; without a key the Alert is one unsent line", async () => {
+  resetAlertState();
+  const lines = [];
+  const log = (line) => lines.push(JSON.parse(line));
+  for (let i = 0; i < THRESHOLD - 1; i += 1) await tokenCheckFailed(env, "network", { log });
+  tokenCheckAnswered();
+  assert.equal(await tokenCheckFailed(env, "network", { log }), false);
+  for (let i = 0; i < THRESHOLD - 1; i += 1) await tokenCheckFailed(env, "network", { log });
+  assert.ok(lines.some((line) => line.event === "operator_alert_unsent" && line.reason === "no key shared with Platform"));
+});
+
+test("the Alert is signed exactly as Platform verifies it (shared/operator_alert.rs holds the same vector)", async () => {
+  assert.equal(await sign("k".repeat(40), '{"a":1}'), "9493cc27bc5916bd8b33d02710f5f2d6f9b0d8727ede9e78fad662a49f2c7246");
 });
 
 test("a misconfigured stage refuses everything rather than trusting a default", async () => {
@@ -160,6 +306,12 @@ test("each stage's Wrangler config serves its own MCP URL with its own Platform,
     assert.equal(config.vars.MCP_RESOURCE, `https://${host}/mcp`);
     assert.equal(config.vars.API_ORIGIN, api);
     assert.deepEqual(config.routes.map((route) => route.pattern).sort(), [host, `${host}/*`]);
-    for (const binding of ["services", "d1_databases", "r2_buckets", "kv_namespaces", "queues"]) assert.equal(config[binding], undefined, binding);
+    // Cloudflare refuses a Worker's fetch to another Worker of our account (error 1042) without it.
+    assert.ok(config.compatibility_flags.includes("global_fetch_strictly_public"));
+    // One binding, to the stage's own Platform: the token check and the Alert.
+    assert.deepEqual(config.services, [{ binding: "PLATFORM", service: `mdrn-platform-${stage}` }]);
+    assert.equal(config.observability.logs.invocation_logs, false, "the Worker's own failure lines only, never a record per request");
+    assert.deepEqual(config.ratelimits.map((limit) => [limit.name, limit.simple]), [["MCP_LIMITER", { limit: 300, period: 60 }]]);
+    for (const binding of ["d1_databases", "r2_buckets", "kv_namespaces", "queues"]) assert.equal(config[binding], undefined, binding);
   }
 });

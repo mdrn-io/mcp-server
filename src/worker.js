@@ -7,8 +7,11 @@
 // the challenge that points the client at this server's metadata. A token that passes is then
 // forwarded to MDRN's API for the tools, which is the whole of what the token can do anyway: the
 // API enforces the grant's workspace, role and scopes on every call, and the token's audience is
-// this server or none (a management token made in the console).
+// this server or none (a management token made in the console). An OAuth access token (one with a
+// grant) must name this server: one for MDRN's API (the CLI) or for no resource (a CLI before 0.4,
+// a client that sent none) is refused, so a token leaked from another client is not usable here.
 import { ApiUnauthorized, MdrnMcpServer, SCOPES_SUPPORTED } from "./server.js";
+import { tokenCheckAnswered, tokenCheckFailed } from "./alert.js";
 // The package's version, which initialize reports (wrangler bundles the JSON).
 import pkg from "../package.json" with { type: "json" };
 
@@ -50,29 +53,79 @@ function challenge(config, error) {
   return json({ error: error ? "invalid_token" : "unauthorized", error_description: error ?? "Sign in to MDRN to use this server." }, 401, { "WWW-Authenticate": value });
 }
 
-// What Platform says of the token: {ok, scopes, resource}, {invalid}, or {unavailable}.
-async function tokenInfo(config, token, fetcher) {
+// The check goes to Platform over the PLATFORM service binding: Worker to Worker, never through
+// the public API host, so no zone rule or fetch restriction stands between them. Only without the
+// binding (a local run) is the public API asked. Never `redirect: "error"`: the Workers runtime
+// throws on it before sending anything, which once made every check a "network" failure (503).
+const PLATFORM_INTERNAL = "https://platform.internal";
+
+// What Platform says of the token: {ok, scopes, resource, grant}, {invalid}, {unavailable, cause} or
+// {broken, cause}. Only a network fault, a timeout or a 5xx is "unavailable" (worth trying
+// again: 503). Any other answer that is neither 401/403 nor a sound 200 means this Worker cannot
+// talk to Platform as it should: that is MDRN's fault and no retry fixes it (500). `cause` is our
+// own short code for the log line and the alert (the thrown error's name, never its text).
+async function tokenInfo(config, token, env, fetcher) {
+  const init = {
+    method: "GET",
+    headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+    redirect: "manual",
+    signal: AbortSignal.timeout(10_000),
+  };
   let response;
   try {
-    response = await fetcher(config.issuer + TOKEN_INFO, {
-      method: "GET",
-      headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
-      redirect: "error",
-      signal: AbortSignal.timeout(10_000),
-    });
-  } catch {
-    return { unavailable: true };
+    response = env.PLATFORM?.fetch
+      ? await env.PLATFORM.fetch(PLATFORM_INTERNAL + TOKEN_INFO, init)
+      : await fetcher(config.issuer + TOKEN_INFO, init);
+  } catch (error) {
+    if (error?.name === "TimeoutError") return { unavailable: true, cause: "timeout" };
+    return { unavailable: true, cause: `network_${String(error?.name ?? "error").replace(/[^A-Za-z]/g, "").slice(0, 32)}` };
   }
   if (response.status === 401 || response.status === 403) return { invalid: true };
-  if (!response.ok) return { unavailable: true };
+  if (response.status >= 500) return { unavailable: true, cause: `status_${response.status}` };
+  if (!response.ok) return { broken: true, cause: `status_${response.status}` };
   let body;
   try {
     body = await response.json();
   } catch {
-    return { unavailable: true };
+    return { broken: true, cause: "body" };
   }
-  if (!Array.isArray(body?.scopes) || !body.scopes.every((scope) => typeof scope === "string")) return { unavailable: true };
-  return { ok: true, scopes: body.scopes, resource: body.resource ?? null };
+  if (!Array.isArray(body?.scopes) || !body.scopes.every((scope) => typeof scope === "string")) return { broken: true, cause: "body" };
+  return { ok: true, scopes: body.scopes, resource: body.resource ?? null, grant: body.grantId ?? null };
+}
+
+// The body as text, read a chunk at a time and given up (null) as soon as it passes MAX_BODY
+// bytes: a chunked body declares no length, and is never read whole first.
+async function bodyText(request) {
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytes += value.byteLength;
+    if (bytes > MAX_BODY) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  const whole = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) { whole.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder().decode(whole);
+}
+
+// Whether the caller's address is within its budget. A limiter that fails lets the request on:
+// the token check after it still holds, and refusing everyone for our fault is worse.
+async function allowed(env, request) {
+  if (!env.MCP_LIMITER?.limit) return true;
+  const key = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  try {
+    return (await env.MCP_LIMITER.limit({ key })).success !== false;
+  } catch {
+    return true;
+  }
 }
 
 export async function handle(request, env, fetcher) {
@@ -102,13 +155,17 @@ export async function handle(request, env, fetcher) {
 
   const bearer = /^Bearer ([!-~]+)$/i.exec(request.headers.get("Authorization") ?? "")?.[1];
   if (!bearer) return challenge(config);
+  // Each address gets a budget of requests before any is checked with Platform, so a flood of
+  // made-up bearers costs Platform nothing past it (MCP_LIMITER, wrangler.*.jsonc). Proxy's own
+  // limits do not cover this hostname. Without the binding (a local run) nothing is counted.
+  if (!(await allowed(env, request))) return json({ jsonrpc: "2.0", id: null, error: { code: -32000, message: "Too many requests; try again in a minute" } }, 429, { "Retry-After": "60" });
   const version = request.headers.get("MCP-Protocol-Version");
   if (version && !PROTOCOL_VERSIONS.includes(version)) return rpcError(400, -32600, `Unsupported MCP-Protocol-Version ${version}`);
   if (!/^application\/json(;|$)/i.test(request.headers.get("Content-Type") ?? "")) return rpcError(415, -32600, "Content-Type must be application/json");
   const declared = Number(request.headers.get("Content-Length") ?? 0);
   if (declared > MAX_BODY) return rpcError(413, -32600, "Request too large");
-  const raw = await request.text();
-  if (raw.length > MAX_BODY) return rpcError(413, -32600, "Request too large");
+  const raw = await bodyText(request);
+  if (raw === null) return rpcError(413, -32600, "Request too large");
   let message;
   try {
     message = JSON.parse(raw);
@@ -118,10 +175,15 @@ export async function handle(request, env, fetcher) {
   if (Array.isArray(message)) return rpcError(400, -32600, "Batched messages are not supported");
   if (!message || typeof message !== "object" || message.jsonrpc !== "2.0") return rpcError(400, -32600, "Invalid Request");
 
-  const info = await tokenInfo(config, bearer, fetcher);
+  const info = await tokenInfo(config, bearer, env, fetcher);
+  if (info.unavailable || info.broken) await tokenCheckFailed(env, info.cause);
+  else tokenCheckAnswered();
   if (info.unavailable) return rpcError(503, -32603, "MDRN could not check this token; try again shortly", message.id ?? null);
+  if (info.broken) return rpcError(500, -32603, "MDRN could not check this token. The fault is ours; try again later", message.id ?? null);
   if (info.invalid) return challenge(config, "The token is unknown, expired or revoked");
-  if (info.resource !== null && canonicalResource(info.resource) !== config.resource) return challenge(config, "The token was not issued for this server");
+  // A management token made in the console has no grant and no resource.
+  const personal = info.grant === null && info.resource === null;
+  if (!personal && canonicalResource(info.resource) !== config.resource) return challenge(config, "The token was not issued for this server");
 
   // A notification or a client's response: accepted, nothing to answer.
   if (typeof message.method !== "string" || !("id" in message)) return new Response(null, { status: 202 });
